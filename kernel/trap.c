@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -67,6 +71,60 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } 
+  else if(r_scause() == 13 || r_scause() == 15){
+    // page fault
+    uint64 fault_addr = r_stval();
+    // check if this va is in the vma range [start_addr, start_addr + length)
+    // and also check p->vmas[i].valid b/c 1. When a VMA is unmapped, you'll set valid = 0 to mark the slot as free. But start_addr still has the old value — it's not zeroed out.
+    // So without checking valid, you might match a stale VMA that was already freed.
+    // we should break once we found the vma and mapped the page!
+    int handled = 0;
+    for(int i = 0; i < 16; i++){
+      if(p->vmas[i].valid && fault_addr >= p->vmas[i].start_addr && fault_addr < p->vmas[i].start_addr + p->vmas[i].length){
+        // found the VMA
+        // 2. kalloc a physical page
+        void *pa = kalloc();
+        if(pa == 0){
+          p->killed = 1;
+          break;
+        }
+        // 3. zero it out with memset
+        memset(pa, 0, PGSIZE);
+    
+        // 4. read file data into pa using readi:
+        struct vma *vma = &p->vmas[i];
+        // if the fault_addr is on the next page of the start_addr, the readi offset should add the page_size into it
+        // round down fault_addr to page boundary, then calculate offset into file
+        uint64 page_offset = PGROUNDDOWN(fault_addr) - vma->start_addr;
+        ilock(vma->f->ip);
+        readi(vma->f->ip, 0, (uint64)pa, vma->offset + page_offset, PGSIZE);
+        iunlock(vma->f->ip);
+        
+        // 5. mappages into pagetable with correct permissions
+        //    prot → PTE flags (PROT_READ→PTE_R, PROT_WRITE→PTE_W, always PTE_U)
+        // PROT_READ	0x1
+        // PROT_WRITE	0x2
+        // PTE_R	1 << 1 = 0x2
+        // PTE_W	1 << 2 = 0x4
+        // PTE_U	1 << 4 = 0x10
+        // mappages(myproc()->pagetable, fault_addr, PGSIZE, pa, vma->prot | PTE_U);
+        int perm = PTE_U;
+        if(vma->prot & PROT_READ)  perm |= PTE_R;
+        if(vma->prot & PROT_WRITE) perm |= PTE_W;
+        // Note we use PGROUNDDOWN(fault_addr) not fault_addr — the VA must be page-aligned for mappages.
+        if(mappages(p->pagetable, PGROUNDDOWN(fault_addr), PGSIZE, (uint64)pa, perm) < 0){
+          kfree(pa);
+          p->killed = 1;
+        }
+        handled = 1;
+        break;
+      }
+    }
+    // After the loop, if no VMA matched, it's a real invalid access — fall through to the existing p->killed = 1 error handling.
+    if (!handled) {
+      p->killed = 1;
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());

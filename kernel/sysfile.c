@@ -2,6 +2,23 @@
 // File-system system calls.
 // Mostly argument checking, since we don't trust
 // user code, and calls into file.c and fs.c.
+// user program
+//     │
+//     │  calls mmap() 
+//     ▼
+// user/usys.pl  
+//     │  generates assembly stub: loads SYS_mmap into a7, calls ecall
+//     ▼
+// kernel/syscall.h
+//     │  defines SYS_mmap = 22 (the number loaded into a7)
+//     ▼
+// kernel/syscall.c
+//     │  syscall() reads a7, looks up syscalls[22], calls sys_mmap
+//     ▼
+// kernel/sysfile.c  (or sysproc.c)
+//     │  actual implementation of sys_mmap
+//     ▼
+// returns value back to user
 //
 
 #include "types.h"
@@ -483,4 +500,72 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+// MAXVA        ┌─────────────────┐
+//              │   trampoline    │  ← fixed at MAXVA-PGSIZE
+//              ├─────────────────┤
+//              │   trapframe     │  ← fixed at MAXVA-2*PGSIZE
+//              ├─────────────────┤
+//              │                 │
+//              │   (free space)  │
+//              │                 │
+// p->sz ──→   ├─────────────────┤  ← top of "normal" user memory
+//              │   heap          │
+//              ├─────────────────┤
+//              │   stack         │
+//              ├─────────────────┤
+//              │   data          │
+//              ├─────────────────┤
+// 0            │   text          │
+//              └─────────────────┘
+// mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+// return val: kernel should decide the virtual address at which to map the file. mmap returns that address, sys_mmap decides the address
+// Returns error: return -1 which as uint64 is 0xffffffffffffffff
+uint64
+sys_mmap(void)
+{
+  // fetch vars from args
+  // addr will always be zero per the lab spec, so you don't need to fetch it
+  // f — the actual struct file* pointer that fd points to in p->ofile[fd]
+  // struct file* is the actual kernel object that tracks the file — it has the inode, reference count, read/write position etc. It persists as long as someone holds a reference to it.
+  // That's exactly why we call filedup(f) — it increments the reference count on the struct file, so even if the user closes fd, the file object stays alive for our VMA to use later during page faults and munmap.
+  uint64 length;
+  int fd, offset, prot, flags;
+  struct file *f;
+  if(argaddr(1, &length) < 0 || argint(2, &prot) < 0 ||
+   argint(3, &flags) < 0 || argfd(4, &fd, &f) < 0 ||
+   argint(5, &offset) < 0)
+    return -1;
+  if(length <= 0 || fd < 0 || fd >= NOFILE || offset < 0)
+    return -1;
+
+  struct proc *p = myproc();
+  // size vmas is 16
+  for (int i = 0; i < 16; i++) {
+    if (p->vmas[i].valid == 0) {
+      // found a empty vma, now fill it
+      p->vmas[i].valid = 1;
+      p->vmas[i].start_addr = p->sz;
+      p->vmas[i].length = length;
+      p->vmas[i].prot = prot;
+      p->vmas[i].flags = flags;
+      p->vmas[i].f = f;
+      p->vmas[i].offset = offset;
+      filedup(f);
+      // Everything below p->sz is already used (code, data, heap)
+      // Everything above is free until the trampoline
+      // So p->sz is the natural next available virtual address
+      p->vmas[i].start_addr = p->sz;  // current top becomes start
+      p->sz += length;
+      return p->vmas[i].start_addr; // return where we mapped it
+    }
+  }
+  return -1;
+}
+
+uint64
+sys_munmap(void)
+{
+  return -1;
 }

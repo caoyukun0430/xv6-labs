@@ -452,6 +452,11 @@ stati(struct inode *ip, struct stat *st)
 // Caller must hold ip->lock.
 // If user_dst==1, then dst is a user virtual address;
 // otherwise, dst is a kernel address.
+// ip	vma->f->ip	the inode of the file to read from
+// user_dst	0	destination is a kernel address (not user)
+// dst	(uint64)pa	kernel address to write data into (our kalloc'd page)
+// off	vma->offset + page_offset	byte offset within the file to start reading
+// n	PGSIZE	number of bytes to read (one full page = 4096)
 int
 readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
 {
