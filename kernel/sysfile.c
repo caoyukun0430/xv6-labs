@@ -525,6 +525,7 @@ sys_pipe(void)
 uint64
 sys_mmap(void)
 {
+
   // fetch vars from args
   // addr will always be zero per the lab spec, so you don't need to fetch it
   // f — the actual struct file* pointer that fd points to in p->ofile[fd]
@@ -540,6 +541,16 @@ sys_mmap(void)
   if(length <= 0 || fd < 0 || fd >= NOFILE || offset < 0)
     return -1;
 
+  // some pre-check
+  // If prot includes PROT_READ, the file must be readable (f->readable)
+  // If prot includes PROT_WRITE and flags is MAP_SHARED, the file must be writable (f->writable)
+  if ((prot & PROT_READ) && !f->readable) {
+    return -1;
+  }
+  if ((prot & PROT_WRITE) && (flags & MAP_SHARED) && !f->writable) {
+    return -1;
+  }
+
   struct proc *p = myproc();
   // size vmas is 16
   for (int i = 0; i < 16; i++) {
@@ -553,10 +564,7 @@ sys_mmap(void)
       p->vmas[i].f = f;
       p->vmas[i].offset = offset;
       filedup(f);
-      // Everything below p->sz is already used (code, data, heap)
-      // Everything above is free until the trampoline
-      // So p->sz is the natural next available virtual address
-      p->vmas[i].start_addr = p->sz;  // current top becomes start
+      p->vmas[i].start_addr = p->sz;
       p->sz += length;
       return p->vmas[i].start_addr; // return where we mapped it
     }
@@ -564,8 +572,67 @@ sys_mmap(void)
   return -1;
 }
 
+
+// Fetch addr and length with argaddr/argint
+// Find the VMA containing addr
+// If MAP_SHARED, write dirty pages back to file
+// uvmunmap(p->pagetable, addr, length/PGSIZE, 1) — unmap and free physical pages
+// Update VMA fields based on which case (start/end/whole)
+
+// Unmap from start
+// vma->start_addr += length;  // move start forward
+// vma->length -= length;      // shrink length
+// Unmap from end
+// // start_addr unchanged
+// vma->length -= length;      // shrink length
+// Unmap whole region
+// vma->valid = 0;             // mark slot as free
+// fileclose(vma->f);          // decrement file ref count
 uint64
 sys_munmap(void)
 {
+  uint64 length, addr;
+  if(argaddr(0, &addr) < 0 || argaddr(1, &length) < 0)
+    return -1;
+  struct proc *p = myproc();
+  for (int i = 0; i < 16; i++) {
+    if(p->vmas[i].valid && addr >= p->vmas[i].start_addr && addr < p->vmas[i].start_addr + p->vmas[i].length) {
+      struct vma *vma = &p->vmas[i];
+      // only write back to file if the mapping is both MAP_SHARED AND PROT_WRITE
+      if(vma->flags & MAP_SHARED && vma->prot & PROT_WRITE){
+        // write back to file at correct offset
+        // xv6 uses a write-ahead log to ensure crash recovery. Any write to disk must be logged first so the filesystem can recover if the system crashes mid-write.
+        // begin_op()/end_op() marks the boundaries of a transaction — everything between them gets logged atomically.
+        begin_op();
+        uint64 file_offset = vma->offset + (addr - vma->start_addr);
+        ilock(vma->f->ip);
+        writei(vma->f->ip, 1, addr, file_offset, length);
+        iunlock(vma->f->ip);
+        end_op();
+      }
+      // BUG uvmunmap(p->pagetable, PGROUNDDOWN(addr), length/PGSIZE, 1);
+      // we should not unmapping a page that was never accessed (never faulted in), so it has no PTE
+      for (uint64 va = PGROUNDDOWN(addr); va < PGROUNDDOWN(addr) + length; va += PGSIZE) {
+        pte_t *pte = walk(p->pagetable, va, 0);
+        if(pte && (*pte & PTE_V)){
+          uvmunmap(p->pagetable, va, 1, 1);
+        }
+      }
+      // check whether is it from start
+      if (addr == vma->start_addr) {
+        vma->start_addr += length;  // move start forward
+        vma->length -= length;      // shrink length
+      } else {
+        // it is at the end
+        vma->length -= length;      // shrink length
+      }
+      // check if Unmap whole region
+      if (vma->length == 0) {
+        vma->valid = 0;
+        fileclose(vma->f);          // decrement file ref count
+      }
+      return 0;
+    }
+  }
   return -1;
 }

@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -302,6 +306,23 @@ fork(void)
 
   np->state = RUNNABLE;
 
+  // copy VMAs from parent to child
+  for(int i = 0; i < 16; i++)
+    np->vmas[i] = p->vmas[i];
+
+  // mmap lab, update vma file reference in child
+  // sys_mmap:         refcount = 2  (1 original fd + 1 from filedup)
+  // original fd closed by user: fileclose → refcount = 1  (only mmap holds it)
+
+  // fork:             child copies vma->f pointer, NO filedup → refcount still = 1
+
+  // parent munmaps:   fileclose → refcount = 0 → FILE FREED!
+  // child accesses VMA → page fault → vma->f is dangling pointer → crash!
+  for(int i = 0; i < 16; i++){
+      if(np->vmas[i].valid)
+          filedup(np->vmas[i].f);
+  }
+
   release(&np->lock);
 
   return pid;
@@ -336,6 +357,11 @@ reparent(struct proc *p)
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait().
+// exit() → p->state = ZOMBIE
+// wait() [called by parent] → freeproc(p)
+//   → proc_freepagetable(p->pagetable, p->sz)
+//     → uvmfree(pagetable, sz)
+//       → uvmunmap(0, sz/PGSIZE)  ← panics on unmapped VMA pages
 void
 exit(int status)
 {
@@ -350,6 +376,34 @@ exit(int status)
       struct file *f = p->ofile[fd];
       fileclose(f);
       p->ofile[fd] = 0;
+    }
+  }
+
+  // lab It's from uvmfree in proc_freepagetable trying to unmap the VMA region that was added to p->sz but never fully mapped.
+  // cleanup safety net for when a process exits without explicitly calling munmap
+  for (int i = 0; i < 16; i++) {
+    if (p->vmas[i].valid == 1) {
+      struct vma *vma = &p->vmas[i];
+      // write back MAP_SHARED pages to file
+      // only write back to file if the mapping is both MAP_SHARED AND PROT_WRITE
+       if(vma->flags & MAP_SHARED && vma->prot & PROT_WRITE){
+            begin_op();
+            ilock(vma->f->ip);
+            writei(vma->f->ip, 1, vma->start_addr, vma->offset, vma->length);
+            iunlock(vma->f->ip);
+            end_op();
+        }
+      // uvmunmap pages that were actually mapped
+      for (uint64 va = vma->start_addr; va < vma->start_addr + vma->length; va += PGSIZE) {
+        pte_t *pte = walk(p->pagetable, va, 0);
+        if(pte && (*pte & PTE_V)) {
+          // free the fault mapped PTEs
+           uvmunmap(p->pagetable, va, 1, 1);
+        }
+      }
+      // fileclose, set valid = 0
+      vma->valid = 0; // mark the VMA slot as free, as munmap is called
+      fileclose(vma->f);
     }
   }
 

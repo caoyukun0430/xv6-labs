@@ -114,5 +114,5 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
-  struct vma vmas[16];         // each proc will have a list of vma, we used fixed array but not *vma b/c Needs kalloc to allocate each VMA — but xv6 kernel allocator only gives full pages (4096 bytes), wasteful for a tiny struct
+  struct vma vmas[16];         // VMA array for mmap mappings
 };

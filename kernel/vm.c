@@ -283,8 +283,20 @@ freewalk(pagetable_t pagetable)
 void
 uvmfree(pagetable_t pagetable, uint64 sz)
 {
-  if(sz > 0)
-    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
+//   In exit, we already unmap all VMA pages that were faulted in. So by the time uvmfree runs, all VMA PTEs are cleared. uvmfree should only see normal process pages.
+
+// But p->sz still includes VMA regions. So uvmunmap in uvmfree tries to unmap those addresses — and panics on pages never faulted in (no PTE).
+
+// The issue is specifically pages that were never faulted in — they have no PTE, so our exit loop skips them correctly. But uvmfree then tries to unmap them and panics.
+
+// So we need uvmfree to skip missing PTEs. The page-by-page check is the right solution. 
+  if(sz > 0){
+    for(uint64 a = 0; a < PGROUNDUP(sz); a += PGSIZE){
+      pte_t *pte = walk(pagetable, a, 0);
+      if(pte && (*pte & PTE_V))
+        uvmunmap(pagetable, a, 1, 1);
+    }
+  }
   freewalk(pagetable);
 }
 
@@ -304,9 +316,11 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
+    // dont need to panic, vma unmapped region will have no PTE, just skip
+      continue;
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+    // dont need to panic, vma unmapped region will have no PTE, just skip
+      continue;
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -320,7 +334,16 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   return 0;
 
  err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
+//  We only need to clean up pages that were successfully mapped before the failure. Pages from i to sz were never mapped — nothing to clean up there.
+// 0          i          sz
+// |--mapped--|--not yet--|
+//   clean up   skip
+//  When uvmcopy fails partway through, it tries to clean up by unmapping pages 0 to i. But some of those pages were skipped (VMA pages) — so uvmunmap panics.
+  for(uint64 j = 0; j < i; j += PGSIZE){
+    pte_t *p = walk(new, j, 0);
+    if(p && (*p & PTE_V))
+      uvmunmap(new, j, 1, 1);
+  }
   return -1;
 }
 
